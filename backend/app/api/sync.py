@@ -4,13 +4,23 @@ Data synchronization API endpoints
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from ..database import get_db
 from ..services import TikTokShopClient, token_manager, DataTransformer
 from ..models import Order, Product, SyncMetadata
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
+
+# Business rule: we only retain/sync data from 2024 onwards
+MIN_SYNC_DATETIME = datetime(2024, 1, 1)
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    """Normalize datetimes to naive UTC for safe comparisons/storage."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 class SyncRequest(BaseModel):
@@ -48,7 +58,7 @@ async def sync_orders_task(db: Session, access_token: str, days_back: int = 30, 
     synced_count = 0
     page_token = None
     start_time = None
-    end_time = None
+    end_time = _to_naive_utc(datetime.utcnow())
     is_full_sync = force_full_sync
     most_recent_order_time = None
     
@@ -61,23 +71,33 @@ async def sync_orders_task(db: Session, access_token: str, days_back: int = 30, 
             
             if sync_meta and sync_meta.last_sync_time:
                 # Incremental sync: fetch orders since last sync with 5-minute overlap
-                start_time = sync_meta.last_sync_time - timedelta(minutes=5)
-                end_time = datetime.utcnow()
+                start_time = _to_naive_utc(sync_meta.last_sync_time - timedelta(minutes=5))
+                if start_time < MIN_SYNC_DATETIME:
+                    start_time = MIN_SYNC_DATETIME
                 is_full_sync = False
                 print(f"Incremental sync: fetching orders since {start_time.isoformat()}")
             else:
-                # First sync - do full sync
+                # First sync - bounded historical sync (never before 2024)
                 is_full_sync = True
-                print("No previous sync found - performing full sync")
+                fallback_start = _to_naive_utc(datetime.utcnow() - timedelta(days=days_back))
+                start_time = max(fallback_start, MIN_SYNC_DATETIME)
+                print(
+                    "No previous sync found - performing initial bounded sync "
+                    f"from {start_time.isoformat()}"
+                )
         else:
-            print("Force full sync requested")
+            start_time = MIN_SYNC_DATETIME
+            print(
+                "Force full sync requested - fetching all orders "
+                f"from {MIN_SYNC_DATETIME.date().isoformat()} onward"
+            )
         
         while True:
             # Fetch orders from TikTok
             response = await client.get_orders(
-                start_time=int(start_time.timestamp()) if start_time else None,
-                end_time=int(end_time.timestamp()) if end_time else None,
-                page_size=100,  # Maximum allowed by TikTok API
+                start_time=start_time,
+                end_time=end_time,
+                page_size=50,  # Maximum allowed by TikTok API
                 page_token=page_token,
                 sort_field="create_time",
                 sort_order="DESC"  # Get newest orders first!
@@ -98,6 +118,11 @@ async def sync_orders_task(db: Session, access_token: str, days_back: int = 30, 
             # Transform and save orders
             for raw_order in orders:
                 order_data = transformer.transform_order(raw_order)
+
+                # Defensive guard: never store pre-2024 data
+                order_created_time = order_data.get("created_time")
+                if order_created_time and order_created_time < MIN_SYNC_DATETIME:
+                    continue
                 
                 # Check if order exists
                 existing = db.query(Order).filter(Order.id == order_data["id"]).first()
@@ -114,10 +139,11 @@ async def sync_orders_task(db: Session, access_token: str, days_back: int = 30, 
                 synced_count += 1
                 
                 # Track most recent order time for metadata
-                if order_data.get("created_at"):
-                    order_time = order_data["created_at"]
+                if order_data.get("created_time"):
+                    order_time = order_data["created_time"]
                     if isinstance(order_time, str):
                         order_time = datetime.fromisoformat(order_time.replace('Z', '+00:00'))
+                    order_time = _to_naive_utc(order_time)
                     if most_recent_order_time is None or order_time > most_recent_order_time:
                         most_recent_order_time = order_time
             
@@ -141,16 +167,16 @@ async def sync_orders_task(db: Session, access_token: str, days_back: int = 30, 
         ).first()
         
         if sync_meta:
-            sync_meta.last_sync_time = datetime.utcnow()
-            sync_meta.last_record_time = most_recent_order_time or datetime.utcnow()
+            sync_meta.last_sync_time = _to_naive_utc(datetime.utcnow())
+            sync_meta.last_record_time = most_recent_order_time or _to_naive_utc(datetime.utcnow())
             sync_meta.records_synced = synced_count
             sync_meta.is_full_sync = 1 if is_full_sync else 0
-            sync_meta.updated_at = datetime.utcnow()
+            sync_meta.updated_at = _to_naive_utc(datetime.utcnow())
         else:
             sync_meta = SyncMetadata(
                 sync_type="orders",
-                last_sync_time=datetime.utcnow(),
-                last_record_time=most_recent_order_time or datetime.utcnow(),
+                last_sync_time=_to_naive_utc(datetime.utcnow()),
+                last_record_time=most_recent_order_time or _to_naive_utc(datetime.utcnow()),
                 records_synced=synced_count,
                 is_full_sync=1 if is_full_sync else 0
             )
@@ -407,7 +433,7 @@ async def sync_orders_full_endpoint(
     db: Session = Depends(get_db)
 ):
     """
-    Force a full resync of all orders (ignores incremental sync metadata)
+    Force a full resync of all orders from 2024 onward (ignores incremental sync metadata)
     
     Use this endpoint when:
     - Initial setup

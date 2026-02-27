@@ -3,29 +3,68 @@
 # TikTok Shop Dashboard - Single Startup Script
 # This script starts both backend and frontend in a single terminal
 
+set -euo pipefail
+
 echo "🚀 Starting TikTok Shop Dashboard..."
 echo ""
 
 # Store the script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Kill any existing instances first
-echo "🧹 Cleaning up any existing instances..."
-pkill -f "uvicorn app.main:app" 2>/dev/null
-pkill -f "vite" 2>/dev/null
-sleep 1
+kill_by_pattern() {
+    local pattern="$1"
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        pkill -TERM -f "$pattern" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f "$pattern" 2>/dev/null || true
+    fi
+}
+
+kill_port() {
+    local port="$1"
+    local pids
+    pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo "$pids" | xargs -r kill -TERM 2>/dev/null || true
+        sleep 1
+        echo "$pids" | xargs -r kill -KILL 2>/dev/null || true
+    fi
+}
+
+cleanup_existing_instances() {
+    echo "🧹 Cleaning up any existing instances..."
+
+    # Kill known backend/frontend processes first
+    kill_by_pattern "uvicorn app.main:app"
+    kill_by_pattern "python -m uvicorn app.main:app"
+    kill_by_pattern "vite"
+
+    # Ensure ports are clear, even if process command line changed
+    kill_port 8000
+    kill_port 3000
+
+    sleep 1
+}
 
 # Function to cleanup on exit
 cleanup() {
     echo ""
     echo "🛑 Shutting down TikTok Shop Dashboard..."
     # Kill all child processes
-    pkill -P $$
-    # Also kill by name to be sure
-    pkill -f "uvicorn app.main:app" 2>/dev/null
-    pkill -f "vite" 2>/dev/null
+    pkill -P $$ 2>/dev/null || true
+
+    # Also kill by name/ports to be sure
+    kill_by_pattern "uvicorn app.main:app"
+    kill_by_pattern "python -m uvicorn app.main:app"
+    kill_by_pattern "vite"
+    kill_port 8000
+    kill_port 3000
+
     exit 0
 }
+
+# Initial cleanup before startup
+cleanup_existing_instances
 
 # Set up trap to catch Ctrl+C
 trap cleanup SIGINT SIGTERM
